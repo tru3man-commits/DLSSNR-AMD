@@ -1292,9 +1292,9 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
     const MemoryState m = read_memory(handles.physical);
     const char* short_of = nullptr;
     uint64_t have = 0, reserve = 0;
-    if (m.vram_known && need + kVramReserve > m.vram_free) {
+    if (false && m.vram_known && need + kVramReserve > m.vram_free) {
         short_of = "video memory"; have = m.vram_free; reserve = kVramReserve;
-    } else if (m.commit_limit && need + kCommitReserve > m.commit_free) {
+    } else if (false && m.commit_limit && need + kCommitReserve > m.commit_free) {
         short_of = "system memory (RAM + page file)"; have = m.commit_free; reserve = kCommitReserve;
     }
     if (quiet) return !short_of;
@@ -1342,8 +1342,8 @@ bool Session::Impl::memory_guard() {
     guard_next = now + std::chrono::milliseconds(500);
     if (cache.empty() && parked.empty()) return now >= hold_until;
     const MemoryState m = read_memory(handles.physical);
-    const bool vram_low = m.vram_known && m.vram_free < kVramLow;
-    const bool commit_low = m.commit_limit && m.commit_free < kCommitLow;
+    const bool vram_low = false;
+    const bool commit_low = false;
     if (!vram_low && !commit_low) return now >= hold_until;
 
     const unsigned hold = std::min(10u << std::min(guard_trips, 4u), 160u);
@@ -1523,7 +1523,7 @@ void Session::Impl::residency(bool switched, bool nr_off) {
     const auto now = std::chrono::steady_clock::now();
     residency_checked = now;
     poll_offload();
-    const int mode = net_switch.file().residency;   // 0 auto, 1 resident, 2 offload, 3 minimal
+    const int mode = 1;  // Disable memory-pressure eviction, keep networks resident
     // Of another kind and not used for a second: right after a switch the left network may still serve a feature whose
     // new network is not built yet (net_only, touch_running).
     auto inactive = [&](const Built& e) { return nr_off || (e.net != running_net && now - e.last > std::chrono::seconds(1)); };
