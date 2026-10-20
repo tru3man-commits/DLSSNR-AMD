@@ -1,4 +1,5 @@
 #include "nr_runtime.hpp"
+#include "nr_temporal_gate.hpp"
 #include "nr_native_plan.hpp"
 #include "nr_runtime_dispatch.hpp"
 #define NR_NO_MAIN 1
@@ -2433,7 +2434,7 @@ EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& fram
     TemporalFrame temporal{frame.reset, frame.feature};
     result.frame = record_all(cmd, frame.colour, c, nullptr, &temporal, &consumed, &frame).frame;
     result.history_consumed = consumed;
-    result.motion_provider = "engine";
+    result.motion_provider = frame.motion_available ? "engine" : "none";
     return result;
 }
 
@@ -2816,7 +2817,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // the first-frame latch, DLSSNR.Reset, and a motion source existing at
         // all.
         uint32_t& gen = fs ? fs->prep_gen : impl_->prep_gen_single;
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset && gen == impl_->prep_gen;
+        gate = temporal_history_gate(fs ? fs->latch : t.latch, temporal->reset,
+                                     gen == impl_->prep_gen, !engine || engine->motion_available);
         gen = impl_->prep_gen;
         // The pre block's noise seed, the DLL's rule: a counter in the pre node
         // (+0xc8) handed to the kernel and then incremented (0x180060f44), zeroed

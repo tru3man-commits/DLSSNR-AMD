@@ -4239,6 +4239,10 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
     ColourFrame look_motion = engine.motion;
     if (neutral) {
         if (!neutral_motion(cmd, colour.width, colour.height, &engine.motion)) return false;
+        // Keep the descriptor, but do not reproject history with fabricated zero
+        // vectors. The pre/post shaders' existing history gate supplies the
+        // current colour and disables temporal blending when guides are absent.
+        engine.motion_available = false;
         engine.motion_x = engine.motion_y = 0;
         engine.motion_texture_width = colour.width; engine.motion_texture_height = colour.height;
         engine.motion_scale_x = engine.motion_scale_y = 1.0f;

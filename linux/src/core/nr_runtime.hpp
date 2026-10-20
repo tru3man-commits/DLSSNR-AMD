@@ -357,6 +357,9 @@ struct EngineFrame {
     // the texture's units into normalized screen units, exactly as the
     // original's MVecScaleX/Y do.
     ColourFrame motion;
+    // False for a dummy descriptor when no motion source exists. A real source
+    // whose vectors happen to be zero is still valid (a stationary scene).
+    bool motion_available = true;
     float motion_scale_x = 1.0f, motion_scale_y = 1.0f;
     // The motion texture's whole allocation when `motion.width/height` name a
     // region of it (a subrect); zero: the same extent.
