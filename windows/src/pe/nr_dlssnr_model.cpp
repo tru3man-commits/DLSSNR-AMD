@@ -32,6 +32,7 @@
 #include "nr_pe_menu.hpp"
 #include "nr_screenshot.hpp"
 #include "nr_pe_session.hpp"
+#include "nr_guide_region.hpp"
 #include "nr_pe_vkdevice.hpp"
 
 #include <algorithm>
@@ -386,17 +387,6 @@ nr::Controls controls_from(const Controls6& in) {
     c.skin_structure = in.skin_structure;
     c.automatic_mask = in.use_auto_mask != 0;
     return c;
-}
-
-// The motion vectors times DLSSNR.MVecScale are in pixels of the motion texture's own region (its
-// subrect, else the whole allocation), and nr::EngineFrame wants normalized screen units: the same
-// number over that extent. Not over the colour's: after the upscaler the model runs on the display
-// image while the vectors stay at render resolution, and OptiScaler passes the game's scale through
-// untouched on purpose ("every resource already carries a subrect saying how big it is", its
-// DlssNr_Dx12_Run.cpp). Dividing by the colour width made them half as long at 4K with FSR
-// Performance; before the upscaler the two extents are the same and nothing changes.
-float normalized_mv_scale(float ngx_scale, unsigned int extent) {
-    return extent != 0 ? ngx_scale / static_cast<float>(extent) : ngx_scale;
 }
 
 // Which vtable slot the host settled on for floats.
@@ -1257,10 +1247,10 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     }
     {
         const D3D12_RESOURCE_DESC md = motion ? motion->GetDesc() : D3D12_RESOURCE_DESC{};
-        const unsigned int mw = motion_rect.width ? motion_rect.width : motion ? unsigned(md.Width) : width;
-        const unsigned int mh = motion_rect.height ? motion_rect.height : motion ? unsigned(md.Height) : height;
-        resources.motion_scale_x = normalized_mv_scale(mv_scale_x, mw);
-        resources.motion_scale_y = normalized_mv_scale(mv_scale_y, mh);
+        const auto region = nr::resolve_guide_region(motion ? uint32_t(md.Width) : width,
+            motion ? md.Height : height, motion_rect.x, motion_rect.y, motion_rect.width, motion_rect.height);
+        resources.motion_scale_x = nr::normalized_guide_motion(mv_scale_x, region.width);
+        resources.motion_scale_y = nr::normalized_guide_motion(mv_scale_y, region.height);
     }
     // OptiScaler's DlssNr encode has already tone-mapped this proxy into the game's own format
     // (DlssNr_Dx12.cpp DispatchPass -> colorCopy), so a float format here is display-referred, not
@@ -1568,10 +1558,12 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     frame.feature = f->id;
     // The caller's flag and nothing else: every feature has its own history now.
     frame.reset = reset != 0;
-    frame.motion_scale_x = normalized_mv_scale(
-        mv_scale_x, motion_rect.width ? motion_rect.width : frame.motion_width ? frame.motion_width : frame.width);
-    frame.motion_scale_y = normalized_mv_scale(
-        mv_scale_y, motion_rect.height ? motion_rect.height : frame.motion_height ? frame.motion_height : frame.height);
+    const auto motion_region = nr::resolve_guide_region(
+        frame.motion_width ? frame.motion_width : frame.width,
+        frame.motion_height ? frame.motion_height : frame.height,
+        motion_rect.x, motion_rect.y, motion_rect.width, motion_rect.height);
+    frame.motion_scale_x = nr::normalized_guide_motion(mv_scale_x, motion_region.width);
+    frame.motion_scale_y = nr::normalized_guide_motion(mv_scale_y, motion_region.height);
 
     f->controls = controls_from(controls);
     f->controls.preprocess = preprocess_now();

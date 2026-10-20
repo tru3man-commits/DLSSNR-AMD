@@ -91,6 +91,9 @@ jobs:
       - name: Test temporal history gating
         run: bash tests/run_temporal_gate.sh
 
+      - name: Test guide region normalization
+        run: bash tests/run_guide_region.sh
+
       - name: Fetch dependencies
         run: bash fetch_deps.sh --windows
 

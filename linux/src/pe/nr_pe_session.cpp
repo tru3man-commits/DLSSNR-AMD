@@ -1,4 +1,5 @@
 #include "nr_pe_session.hpp"
+#include "nr_guide_region.hpp"
 #include "nr_ini_network.hpp"
 #include "nr_pe_config.hpp"   // NetworkSwitch
 #include "nr_pe_log.hpp"
@@ -2322,9 +2323,9 @@ void apply_guide_subrect(ColourFrame* guide, const Session::Subrect& want, const
     // The region the game rendered into: from the base, the given extent (or the
     // rest of the texture), clipped to the texture - NVIDIA's own reading of the
     // subrect (base and extent, nvngx_dlssnr.dll 0x180022278).
-    const uint32_t w = want.width ? std::min(want.width, aw - want.x) : aw - want.x;
-    const uint32_t h = want.height ? std::min(want.height, ah - want.y) : ah - want.y;
-    *base_x = want.x; *base_y = want.y;
+    const auto region = nr::resolve_guide_region(aw, ah, want.x, want.y, want.width, want.height);
+    const uint32_t w = region.width, h = region.height;
+    *base_x = region.x; *base_y = region.y;
     // A depth region that is not the whole image is read through the runtime's
     // copy, not sampled in place. Motion keeps its usage: it is sampled in place
     // through the region's base and share of the allocation.
