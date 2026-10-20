@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 21422)
-Total output lines: 1660
-
 // The DLSS-NR model behind both doors; see nr_dlssnr_model.hpp for which two and why.
 //
 // Everything here was linux/src/pe/nr_dlssnr_forwarder.cpp's anonymous namespace and the bodies of its
@@ -726,7 +723,321 @@ void sweep_retired() {
     size_t keep = 0;
     for (size_t i = 0; i < g_retired.size(); ++i) {
         if (g_retired[i].deadline <= g_readback_recordings) {
-            g_ret…3422 tokens truncated…be_float(void* params, const char* name, float value, int slot) {
+            g_retired[i].res->Release();
+        } else {
+            g_retired[keep++] = g_retired[i];
+        }
+    }
+    g_retired.resize(keep);
+}
+
+}  // namespace
+
+// The two buffers and the footprint that describes them. One per feature, sized from the region that
+// is actually scored rather than from the whole image: the centre quarter by area is the centre half
+// of each axis, so the copy, the memory and the PCIe traffic are all a quarter of the frame.
+struct DebugReadback {
+    ID3D12Resource* in = nullptr;    // the output right after the seed copy == the model's input
+    ID3D12Resource* out = nullptr;   // the output after run_after recorded the network
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    uint64_t bytes = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT box_x = 0, box_y = 0;       // where the footprint sits in the source image
+    bool pending = false;            // a pair is recorded and not yet mapped
+    uint64_t pending_n = 0;          // which evaluate of this feature recorded it
+    bool have_stats = false;         // stats below belong to stats_n and have not been logged
+    uint64_t stats_n = 0;
+    ReadbackStats stats{};
+    bool dumped = false;             // NR_DEBUG_DUMP=1: the one pair written as PPM
+};
+
+namespace {
+
+void readback_free(DebugReadback& rb) {
+    retire_buffer(rb.in);
+    retire_buffer(rb.out);
+    rb.in = rb.out = nullptr;
+    rb.pending = false;
+    rb.bytes = 0;
+}
+
+ID3D12Resource* make_readback_buffer(ID3D12Device* device, uint64_t bytes) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ID3D12Resource* res = nullptr;
+    const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&res));
+    if (FAILED(hr)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            log("[nr] readback: could not allocate a %llu byte readback buffer (0x%08lx)",
+                static_cast<unsigned long long>(bytes), static_cast<unsigned long>(hr));
+        }
+        return nullptr;
+    }
+    return res;
+}
+
+// Size the pair against this frame's output. Returns false when the format is one this cannot decode
+// or the allocation failed, in which case nothing is recorded and nothing is logged.
+bool readback_ensure(ID3D12Device* device, DebugReadback& rb, ID3D12Resource* tex) {
+    const D3D12_RESOURCE_DESC d = tex->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    if (readback_bpp(d.Format) == 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            log("[nr] readback: unsupported format %u", static_cast<unsigned>(d.Format));
+        }
+        return false;
+    }
+
+    // NR_DEBUG_DUMP_FULL=1: the whole frame rather than the middle quarter.
+    //
+    // **The crop is not a smaller version of the frame.** The model's bottleneck
+    // attends over the whole image, so its answer for the middle of a 4K frame
+    // is not the answer it gives that crop on its own - measured at 3.2 points
+    // of mean luminance, and the in-game gap being chased is 15. A centre crop
+    // therefore cannot be replayed offline against anything, and every
+    // comparison made from one has had to be thrown away. Costs 4x the readback
+    // (two 32 MB buffers at 4K) and is off by default for that reason.
+    static const bool full = [] {
+        char v[8] = {}; const DWORD n = GetEnvironmentVariableA("NR_DEBUG_DUMP_FULL", v, sizeof v);
+        const bool on = n > 0 && v[0] == '1';
+        if (on) log("[nr] NR_DEBUG_DUMP_FULL=1: the readback pair is the whole frame");
+        return on;
+    }();
+    const UINT w = static_cast<UINT>(d.Width), h = static_cast<UINT>(d.Height);
+    UINT bx = 0, by = 0, bw = w, bh = h;
+    if (!full && w >= 8 && h >= 8) { bx = w / 4; by = h / 4; bw = w / 2; bh = h / 2; }
+
+    if (rb.in && rb.out && rb.format == d.Format && rb.box_x == bx && rb.box_y == by &&
+        rb.fp.Footprint.Width == bw && rb.fp.Footprint.Height == bh)
+        return true;
+
+    // The extent or the format moved under us (OptiScaler recreates a feature for that, but a
+    // debugging switch does not get to assume it). The old pair may still be a copy destination in a
+    // list in flight, so it is retired rather than released.
+    readback_free(rb);
+
+    D3D12_RESOURCE_DESC sub = d;
+    sub.Width = bw;
+    sub.Height = bh;
+    sub.DepthOrArraySize = 1;
+    sub.MipLevels = 1;
+    UINT rows = 0;
+    UINT64 row_bytes = 0, total = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    device->GetCopyableFootprints(&sub, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+    if (total == 0) return false;
+
+    rb.in = make_readback_buffer(device, total);
+    rb.out = rb.in ? make_readback_buffer(device, total) : nullptr;
+    if (!rb.in || !rb.out) {
+        readback_free(rb);
+        return false;
+    }
+    rb.fp = fp;
+    rb.bytes = total;
+    rb.format = d.Format;
+    rb.box_x = bx;
+    rb.box_y = by;
+    log("[nr] readback: scoring %ux%u at (%u,%u) of %ux%u fmt %u, %llu bytes x2",
+        bw, bh, bx, by, w, h, static_cast<unsigned>(d.Format),
+        static_cast<unsigned long long>(total));
+    return true;
+}
+
+// One CopyTextureRegion with the state round trip around it. `state` is the state the caller holds
+// the resource in across the evaluate and the state it is put back into, so nothing downstream can
+// tell this happened.
+void readback_record(ID3D12GraphicsCommandList* cmd, const DebugReadback& rb, ID3D12Resource* src,
+                     D3D12_RESOURCE_STATES state, ID3D12Resource* dst) {
+    if (!dst) return;
+    barrier(cmd, src, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    D3D12_TEXTURE_COPY_LOCATION dl{};
+    dl.pResource = dst;
+    dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dl.PlacedFootprint = rb.fp;
+
+    D3D12_TEXTURE_COPY_LOCATION sl{};
+    sl.pResource = src;
+    sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    sl.SubresourceIndex = 0;
+
+    D3D12_BOX box{};
+    box.left = rb.box_x;
+    box.top = rb.box_y;
+    box.front = 0;
+    box.right = rb.box_x + rb.fp.Footprint.Width;
+    box.bottom = rb.box_y + rb.fp.Footprint.Height;
+    box.back = 1;
+    cmd->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
+
+    barrier(cmd, src, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+}
+
+// Map the pair recorded one evaluate ago and score it over every 16th pixel of the copied region.
+// NR_DEBUG_DUMP=1: one mapped readback buffer as a binary PPM beside the log, values clamped to
+// [0,1] and scaled to 8 bits with no transfer curve (the proxy is display-referred already).
+void dump_ppm(const DebugReadback& rb, const uint8_t* base, uint64_t feature_id, const char* which) {
+    std::string path = nr::pe::log_path() ? nr::pe::log_path() : "";
+    const size_t cut = path.find_last_of("\\/");
+    path = (cut == std::string::npos) ? std::string() : path.substr(0, cut + 1);
+    char name[96];
+    std::snprintf(name, sizeof name, "dlssnr-amd-f%u-e%u-%s.ppm", static_cast<unsigned>(feature_id),
+                  static_cast<unsigned>(rb.pending_n), which);
+    path += name;
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) { log("[nr] dump: cannot write %s", path.c_str()); return; }
+    const UINT w = rb.fp.Footprint.Width, h = rb.fp.Footprint.Height;
+    const size_t pitch = rb.fp.Footprint.RowPitch;
+    const unsigned bpp = readback_bpp(rb.format);
+    std::fprintf(fp, "P6\n%u %u\n255\n", static_cast<unsigned>(w), static_cast<unsigned>(h));
+    std::vector<uint8_t> row(static_cast<size_t>(w) * 3);
+    for (UINT y = 0; y < h; ++y) {
+        const uint8_t* src = base + static_cast<size_t>(y) * pitch;
+        for (UINT x = 0; x < w; ++x) {
+            float c[3];
+            decode_rgb(src + static_cast<size_t>(x) * bpp, rb.format, c);
+            for (int k = 0; k < 3; ++k) {
+                const float v = std::isfinite(c[k]) ? std::clamp(c[k], 0.0f, 1.0f) : 0.0f;
+                row[static_cast<size_t>(x) * 3 + k] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+            }
+        }
+        std::fwrite(row.data(), 1, row.size(), fp);
+    }
+    std::fclose(fp);
+    log("[nr] dump: wrote %s", path.c_str());
+}
+
+bool readback_drain(DebugReadback& rb, uint64_t feature_id) {
+    if (!rb.pending || !rb.in || !rb.out) return false;
+    rb.pending = false;
+
+    const uint8_t* a = nullptr;
+    const uint8_t* b = nullptr;
+    D3D12_RANGE all{0, static_cast<SIZE_T>(rb.bytes)};
+    const D3D12_RANGE none{0, 0};
+    if (FAILED(rb.in->Map(0, &all, reinterpret_cast<void**>(const_cast<uint8_t**>(&a)))) || !a)
+        return false;
+    if (FAILED(rb.out->Map(0, &all, reinterpret_cast<void**>(const_cast<uint8_t**>(&b)))) || !b) {
+        rb.in->Unmap(0, &none);
+        return false;
+    }
+
+    // EVERY sampled pair whose input carries a picture, overwriting the last (pair 1 of a feature is
+    // often mapped before the GPU reached it and reads as zeros).
+    //
+    // It used to write the first pair only, and the first pair is worthless: the readback samples
+    // evaluates 1, 2, 3 and then every 300th, and at evaluate 2-3 the network is usually still
+    // building, so the pair on disk was a passthrough - input and output identical, 0.00% changed.
+    // Overwriting means the files left after a twenty-second run are from evaluate 300 or 600, which
+    // is the picture the model is actually being given in the game. That input is the one thing the
+    // offline harness cannot synthesize: OptiScaler's encoded proxy, with the game's own exposure
+    // and white point in it.
+    if (debug_dump_on() && rb.pending_n >= 2) {
+        rb.dumped = true;
+        dump_ppm(rb, a, feature_id, "in");
+        dump_ppm(rb, b, feature_id, "out");
+    }
+
+    const UINT w = rb.fp.Footprint.Width, h = rb.fp.Footprint.Height;
+    const size_t pitch = rb.fp.Footprint.RowPitch;
+    const unsigned bpp = readback_bpp(rb.format);
+    ReadbackStats s{};
+    for (UINT y = 0; y < h; y += 16) {
+        const uint8_t* ra = a + static_cast<size_t>(y) * pitch;
+        const uint8_t* rbrow = b + static_cast<size_t>(y) * pitch;
+        for (UINT x = 0; x < w; x += 16) {
+            float ci[3], co[3];
+            decode_rgb(ra + static_cast<size_t>(x) * bpp, rb.format, ci);
+            decode_rgb(rbrow + static_cast<size_t>(x) * bpp, rb.format, co);
+            bool finite = true;
+            for (int k = 0; k < 3; ++k)
+                if (!std::isfinite(ci[k]) || !std::isfinite(co[k])) finite = false;
+            if (!finite) { ++s.nonfinite; continue; }
+            const double cmax = std::max({double(ci[0]), double(ci[1]), double(ci[2])});
+            if (cmax > s.in_max) s.in_max = cmax;
+            if (cmax > 1.0) ++s.in_over1;
+            s.in_luma += luma_of(ci);
+            s.out_luma += luma_of(co);
+            double biggest = 0;
+            for (int k = 0; k < 3; ++k) {
+                const double d = std::fabs(static_cast<double>(co[k]) - static_cast<double>(ci[k]));
+                s.mean_abs[k] += d;
+                if (d > biggest) biggest = d;
+            }
+            if (biggest > s.max_abs) s.max_abs = biggest;
+            if (biggest > 1.0 / 255.0) s.changed += 1.0;
+            ++s.samples;
+        }
+    }
+    rb.in->Unmap(0, &none);
+    rb.out->Unmap(0, &none);
+
+    if (s.samples) {
+        const double inv = 1.0 / static_cast<double>(s.samples);
+        s.in_luma *= inv;
+        s.out_luma *= inv;
+        for (int k = 0; k < 3; ++k) s.mean_abs[k] *= inv;
+        s.changed *= inv;
+    }
+    rb.stats = s;
+    rb.stats_n = rb.pending_n;
+    rb.have_stats = true;
+    return true;
+}
+
+// The one line, emitted immediately after the per-evaluate line of the evaluate that drained it.
+void readback_log(const Feature* f, DebugReadback& rb) {
+    if (!rb.have_stats) return;
+    rb.have_stats = false;
+    const ReadbackStats& s = rb.stats;
+    log("[nr] readback #%u (%u) in luma %.4f out luma %.4f mean|d| %.5f %.5f %.5f changed %.2f%% "
+        "max %.5f",
+        static_cast<unsigned>(f->id), static_cast<unsigned>(rb.stats_n), s.in_luma, s.out_luma,
+        s.mean_abs[0], s.mean_abs[1], s.mean_abs[2], s.changed * 100.0, s.max_abs);
+    log("[nr] readback #%u (%u) input max %.4f, %.3f%% of samples above 1.0", static_cast<unsigned>(f->id),
+        static_cast<unsigned>(rb.stats_n), s.in_max,
+        s.samples ? 100.0 * double(s.in_over1) / double(s.samples) : 0.0);
+    if (s.nonfinite)
+        log("[nr] readback #%u (%u) %llu of %llu samples were not finite and were dropped",
+            static_cast<unsigned>(f->id), static_cast<unsigned>(rb.stats_n),
+            static_cast<unsigned long long>(s.nonfinite),
+            static_cast<unsigned long long>(s.nonfinite + s.samples));
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------------------------
+// The parameter block.
+// ---------------------------------------------------------------------------------------------
+
+void set_float_slot(int slot) {
+    if (slot >= 0 && slot < 8) g_float_slot = slot;
+}
+
+void probe_float(void* params, const char* name, float value, int slot) {
     if (!params || slot < 0 || slot >= 8) return;
     void** vt = *reinterpret_cast<void***>(params);
     reinterpret_cast<PFN_SetFloat>(vt[slot])(params, name, value);
