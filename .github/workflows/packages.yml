@@ -88,6 +88,9 @@ jobs:
             artifacts/ref
           key: deps-windows-${{ hashFiles('fetch_deps.sh') }}
 
+      - name: Test temporal history gating
+        run: bash tests/run_temporal_gate.sh
+
       - name: Fetch dependencies
         run: bash fetch_deps.sh --windows
 
