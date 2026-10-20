@@ -15,9 +15,24 @@ int main() {
     const bool reset[] = {true, false, false, false, false, true};
     const bool expected[] = {false, true, false, false, true, false};
     bool latched = false;
+    unsigned old_history_reads = 0, fixed_history_reads = 0, false_reads_removed = 0;
     for (unsigned frame = 0; frame != 6; ++frame) {
-        assert(nr::temporal_history_gate(latched, reset[frame], true, guides[frame]) == expected[frame]);
+        // Baseline before the fix: the host gate knew reset/latch/preprocess,
+        // but it treated the dummy zero-vector image as a correspondence source.
+        const bool before = latched && !reset[frame];
+        const bool after = nr::temporal_history_gate(latched, reset[frame], true, guides[frame]);
+        assert(after == expected[frame]);
+        old_history_reads += before;
+        fixed_history_reads += after;
+        false_reads_removed += before && !after;
+        if (guides[frame]) assert(before == after);
         latched = true; // recorded output remains available even without guides
     }
-    std::cout << "PASS: 16 gate states and 6-frame guide loss/recovery/reset sequence\n";
+    assert(old_history_reads == 4);
+    assert(fixed_history_reads == 2);
+    assert(false_reads_removed == 2);
+    std::cout << "PASS: 16 gate states; same 6-frame sequence: history reads "
+              << old_history_reads << " -> " << fixed_history_reads
+              << ", false reads removed=" << false_reads_removed << "\n";
 }
+
