@@ -187,6 +187,10 @@ class Device {
     bool keyed_mutex_{};
 
     std::mutex jobs_mutex_;
+    // Per-device ordering, protected by jobs_mutex_. Another adapter must not
+    // age this device's recordings or race its submission counters.
+    uint64_t begins_{};
+    uint64_t submits_{};
     // The command pool is externally synchronised: held from begin() to end()/abort(), across the
     // caller's recording, and by anything else that allocates from the pool.
     std::mutex record_mutex_;

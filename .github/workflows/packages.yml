@@ -21,7 +21,21 @@ permissions:
   contents: write
 
 jobs:
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test temporal history gating
+        run: bash tests/run_temporal_gate.sh
+      - name: Test guide region normalization
+        run: bash tests/run_guide_region.sh
+      - name: Test Windows bridge submission lifecycle
+        run: bash tests/run_bridge_submit.sh
+
   linux:
+    needs: cpu-tests
     if: ${{ !contains(github.ref_name, '-win-') }}
     runs-on: ubuntu-24.04
     steps:
@@ -66,6 +80,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: cpu-tests
     if: ${{ vars.WINDOWS_PACKAGE != 'off' && !contains(github.ref_name, '-linux-') }}
     runs-on: ubuntu-24.04
     steps:
@@ -87,12 +102,6 @@ jobs:
             !toolchain/GE-Proton11-7-x86_64
             artifacts/ref
           key: deps-windows-${{ hashFiles('fetch_deps.sh') }}
-
-      - name: Test temporal history gating
-        run: bash tests/run_temporal_gate.sh
-
-      - name: Test guide region normalization
-        run: bash tests/run_guide_region.sh
 
       - name: Fetch dependencies
         run: bash fetch_deps.sh --windows
