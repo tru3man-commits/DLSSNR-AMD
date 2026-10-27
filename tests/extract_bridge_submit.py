@@ -31,6 +31,8 @@ end = header.index("    // One shared fence", begin)
 (out / "bridge_methods.inc").write_text("\n".join(definition(start) for start in (
     "bool Device::submit_keyed(", "void Device::drop_locked(",
     "void Device::discard(", "void Device::cancel(", "bool Device::submit(",
+    "void Device::lost(", "bool Device::run_between(ID3D12CommandQueue*",
+    "bool Device::run_between(ID3D11DeviceContext*",
 )))
 (out / "bridge_clock.inc").write_text(
     "uint64_t& clock() { return "

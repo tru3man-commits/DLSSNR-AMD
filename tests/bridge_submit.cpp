@@ -44,6 +44,38 @@ template<class... T> void log(const char*, T...) {}
 struct Image { VkDeviceMemory memory{}; };
 #include "bridge_job.inc"
 
+using HRESULT = int32_t;
+constexpr HRESULT DXGI_ERROR_DEVICE_REMOVED = -10, DXGI_ERROR_DEVICE_RESET = -11;
+constexpr bool FAILED(HRESULT hr) { return hr < 0; }
+constexpr bool SUCCEEDED(HRESULT hr) { return hr >= 0; }
+struct IUnknown {
+    int refs = 1;
+    void AddRef() { ++refs; }
+    void Release() { --refs; }
+};
+struct ID3D12Fence : IUnknown { uint64_t GetCompletedValue() { return 0; } };
+struct ID3D11Fence : IUnknown {};
+struct QueueCalls : IUnknown {
+    std::vector<uint64_t> signals, waits;
+    HRESULT signal_result{}, wait_result{};
+    bool fail_second_signal = false;
+    int flushes{};
+    template<class Fence> HRESULT Signal(Fence*, uint64_t value) {
+        signals.push_back(value);
+        return fail_second_signal && signals.size() == 2 ? -1 : signal_result;
+    }
+    template<class Fence> HRESULT Wait(Fence*, uint64_t value) {
+        waits.push_back(value); return wait_result;
+    }
+    void Flush() { ++flushes; }
+};
+struct ID3D12CommandQueue : QueueCalls {};
+struct ID3D11DeviceContext : QueueCalls {
+    template<class T> HRESULT QueryInterface(T** out) { *out = static_cast<T*>(this); AddRef(); return 0; }
+};
+struct ID3D11DeviceContext4 : ID3D11DeviceContext {};
+#define IID_PPV_ARGS(pp) pp
+
 struct Device {
     bool lost_{};
     std::mutex queue_mutex_;
@@ -55,6 +87,16 @@ struct Device {
     void cancel(const void*);
     bool submit(Job*, uint64_t, VkSemaphore, uint64_t, VkSemaphore, uint64_t);
     bool submit_keyed(Job*, uint64_t, const std::vector<const Image*>&, uint64_t, uint64_t);
+    bool run_between(ID3D12CommandQueue*, Job*, uint64_t);
+    bool run_between(ID3D11DeviceContext*, Job*, uint64_t);
+    void lost(const char*);
+    std::mutex sync_mutex_;
+    IUnknown* hand_over_queue_{};
+    struct Timeline { VkSemaphore semaphore = 1; IUnknown* fence{}; uint64_t value{}; } timeline_;
+    Timeline* timeline_d3d12(ID3D12CommandQueue*) { return &timeline_; }
+    Timeline* timeline_d3d11(ID3D11DeviceContext*) { return &timeline_; }
+    std::vector<int> buried_;
+    void sweep_buried_locked(uint64_t) {}
     Job* ready(uint64_t serial = 1) {
         auto j = std::make_unique<Job>();
         j->state = Job::Ready; j->serial = serial; j->gen = 1;
@@ -191,6 +233,37 @@ int main() {
         newer->dropped = [&] { ++drops; check(unlocked(d.jobs_mutex_), "order callback is outside lock"); };
         check(run(d, newer, false) && drops == 1 && older->state == Job::Ready,
               "out-of-order submission still requests a history restart");
+    }
+    // A successful Vulkan submit is insufficient: DirectX must accept the wait
+    // before the caller can safely copy the network's result back to the game.
+    for (bool d3d11 : {false, true}) {
+        for (int scenario = 0; scenario != 5; ++scenario) {
+            Device d;
+            ID3D12CommandQueue q12;
+            ID3D11DeviceContext4 q11;
+            ID3D12Fence f12;
+            ID3D11Fence f11;
+            QueueCalls& q = d3d11 ? static_cast<QueueCalls&>(q11) : static_cast<QueueCalls&>(q12);
+            d.timeline_.fence = d3d11 ? static_cast<IUnknown*>(&f11) : static_cast<IUnknown*>(&f12);
+            Job* j = d.ready();
+            // 0: normal, 1: wait refused, 2: ready signal refused,
+            // 3: NR submit failed, 4: NR failed and fallback done signal refused.
+            if (scenario == 1) q.wait_result = -1;
+            if (scenario == 2) q.signal_result = -1;
+            if (scenario >= 3) next_result = -1;
+            q.fail_second_signal = scenario == 4;
+            const bool ran = d3d11 ? d.run_between(&q11, j, 1) : d.run_between(&q12, j, 1);
+            next_result = VK_SUCCESS;
+            check(ran == (scenario == 0), "handover succeeds only when submission AND DirectX wait succeed");
+            check(d.lost_ == (scenario == 1), "refused DirectX wait stops further network work");
+            check(q.signals == (scenario >= 3 ? std::vector<uint64_t>{1, 2} : std::vector<uint64_t>{1}),
+                  "failed NR work signals done from DirectX to avoid a permanent wait");
+            const bool should_wait = scenario != 2 && scenario != 4;
+            check(q.waits == (should_wait ? std::vector<uint64_t>{2} : std::vector<uint64_t>{}),
+                  "never wait for a value that neither API can signal");
+            if (d3d11) check(q.flushes == (scenario == 2 ? 0 : 1) && q11.refs == 2,
+                             "D3D11 publishes ready and releases its temporary context reference");
+        }
     }
     std::cout << (failures ? "FAIL: " : "PASS: ") << checks << " bridge checks, " << failures
               << " failures (fake Vulkan queue; no GPU inference)\n";

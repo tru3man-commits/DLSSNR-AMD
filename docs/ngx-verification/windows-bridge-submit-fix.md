@@ -30,12 +30,20 @@ must reject a discarded job before it can reach Vulkan.
    adapter could incorrectly age another adapter's recorded frame. The counters
    are now per-device under `jobs_mutex_`. One-time diagnostics in these submit
    methods use atomic flags because they remain shared across devices.
+5. **A refused DirectX wait still reported success.** After a successful Vulkan
+   submit, both `run_between()` overloads returned true even when the D3D11/D3D12
+   `Wait` call failed. The queue-level callers could then copy unfinished network
+   output back into the game's target. Success now requires the DirectX wait to
+   succeed too. The existing device-loss stop remains in place. The D3D12 split
+   route already records its continuation in advance and ignores this return
+   value; this change does not make that continuation conditional.
 
 ## Regression tests
 
 Run `bash tests/run_bridge_submit.sh`. The test extracts the actual production
-`Job` definition, Device job members and submit/drop/discard/cancel methods into
-a temporary translation unit and compiles them against a fake Vulkan queue.
+`Job` definition, Device job members and submit/drop/discard/cancel/handover
+methods into a temporary translation unit and compiles them against fake Vulkan
+and DirectX queues.
 It does not maintain a separate implementation of the lifecycle. The extractor
 fails if a required definition disappears.
 
@@ -43,11 +51,13 @@ Coverage includes stale/lost jobs with and without callbacks, the exact age
 boundary, two adapters, invalid generations, duplicate submissions, discarded
 jobs, injected queue failures, persistent device loss, lock ownership during
 submission, callback reentry, out-of-order history notification and preservation
-of timeline values/keyed-mutex payloads. The lock probe runs on another thread.
+of timeline values/keyed-mutex payloads. DirectX tests inject failed ready
+signals, refused waits and failed fallback signals, and check D3D11 flush and
+temporary reference handling. The lock probe runs on another thread.
 The runner has a timeout so a callback deadlock fails CI instead of hanging it.
 
-The same harness against the baseline source reports **22 failed checks**;
-the patched source reports **85 checks, zero failures**. Total check counts
+The same harness against the baseline source reports **24 failed checks**;
+the patched source reports **138 checks, zero failures**. Total check counts
 differ because rejected frames no longer enter the fake Vulkan function or
 invoke callbacks on paths they should not take. To replay the baseline, export
 its `windows/src/pe/nr_pe_bridge.{cpp,hpp}` into a directory and pass that directory

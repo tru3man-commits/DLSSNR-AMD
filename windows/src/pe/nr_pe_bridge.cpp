@@ -1144,7 +1144,7 @@ bool Device::run_between(ID3D12CommandQueue* queue, Job* job, uint64_t generatio
         log("[nr] bridge: the D3D12 queue refused to wait for the network (0x%08lX)", (unsigned long)hr);
         lost("the D3D12 queue does not wait on the shared fence");
     }
-    return ok;
+    return ok && SUCCEEDED(hr);
 }
 
 bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t generation) {
@@ -1184,7 +1184,7 @@ bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t genera
         lost("the D3D11 context does not wait on the shared fence");
     }
     c4->Release();
-    return ok;
+    return ok && SUCCEEDED(hr);
 }
 
 
