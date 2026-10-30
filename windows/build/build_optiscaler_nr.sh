@@ -54,6 +54,8 @@ source windows/build/arch/rdna4.sh
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c windows/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c windows/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
+"$cxx" "${common[@]}" -c windows/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"
+"$cxx" "${common[@]}" -c windows/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_log.cpp -o "$out/log.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_crash.cpp -o "$out/crash.o"
 "$cxx" "${common[@]}" -c windows/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
@@ -93,7 +95,7 @@ ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 # import of vulkan-1.dll forces winevulkan up before the game's graphics stack, which has killed a
 # real game. This link is expected to fail; its failure is the input to the next step.
 shared_objs=("$out/model.o" "$out/session.o" "$out/bridge.o" "$out/d3d12split.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/crash.o" "$out/vkdevice.o"
-             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o"
+             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_wilsjo2.o" "$out/vram_ledger.o" "$out/renodx_route.o" "$out/control.o"
              "$out/menu.o" "$out"/im_*.o "$out/screenshot.o" "$out"/mh_*.o)
 forwarder_objs=("$out/forwarder.o" "${shared_objs[@]}")
 core_objs=("$out/ngx_core.o" "$out/optifix.o" "${shared_objs[@]}")
@@ -132,13 +134,21 @@ plain() { echo "$1" | sed 's/^_//; s/@[0-9]*$//'; }
     echo '#include <windows.h>'
     echo 'long nr_vk_unresolved(void) { return -3; }   // VK_ERROR_INITIALIZATION_FAILED'
     for sym in $undefined; do printf 'extern void* nr_vk_p_%s;\n' "$(plain "$sym")"; done
+    echo 'const char* nr_vk_source = "vulkan-1.dll";'
+    echo 'int nr_vk_missing;'
+    echo 'const char* nr_vk_first_missing = "";'
+    # Native Windows always uses the Khronos loader.
+    echo 'void nr_vk_use_loader(int yes) { (void)yes; }'
+    # ReShade has removed this Vulkan device from its table. Device destruction reclaims NR's objects.
+    echo 'int nr_vk_device_direct(void* device, int on) { (void)device; return on ? -1 : 0; }'
     echo 'void nr_vk_load(void) {'
     echo '    HMODULE m = GetModuleHandleW(L"vulkan-1.dll");'
     echo '    if (!m) m = LoadLibraryW(L"vulkan-1.dll");'
-    echo '    if (!m) return;'
+    echo '    nr_vk_missing = 0; nr_vk_first_missing = "";'
+    echo '    if (!m) { nr_vk_missing = 1; nr_vk_first_missing = "vulkan-1.dll"; return; }'
     for sym in $undefined; do
         base=$(plain "$sym")
-        printf '    { void* p = (void*)GetProcAddress(m, "%s"); if (p) nr_vk_p_%s = p; else OutputDebugStringA("nr_vk_load: no export %s"); }\n' "$base" "$base" "$base"
+        printf '    { void* p = (void*)GetProcAddress(m, "%s"); if (p) nr_vk_p_%s = p; else { if (!nr_vk_missing++) nr_vk_first_missing = "%s"; OutputDebugStringA("nr_vk_load: missing Vulkan export"); } }\n' "$base" "$base" "$base"
     done
     echo '}'
 } > "$out/vulkan_lazy.c"

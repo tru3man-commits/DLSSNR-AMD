@@ -31,6 +31,8 @@ jobs:
         run: bash tests/run_temporal_gate.sh
       - name: Test guide region normalization
         run: bash tests/run_guide_region.sh
+      - name: Test GPU completion retention
+        run: bash tests/run_gpu_completion.sh
       - name: Test Windows bridge submission lifecycle
         run: bash tests/run_bridge_submit.sh
 
@@ -46,7 +48,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-multilib python3 libx11-dev libxcb1-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-multilib python3 p7zip-full
 
       - name: Cache pinned dependencies
         uses: actions/cache@v4

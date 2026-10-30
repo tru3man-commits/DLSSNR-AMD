@@ -25,6 +25,7 @@ done
 cp -- "$NR_PRODUCT_SPV"/runtime/* "$dst/shaders/runtime/"
 cp -- "$NR_PRODUCT_SPV"/temporal/* "$dst/shaders/temporal/"
 bash windows/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoDX-style option
+bash windows/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null
 cp -- windows/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 
 # The weights are NVIDIA's and are never part of this repository: --model takes a dlssnr.bin made
