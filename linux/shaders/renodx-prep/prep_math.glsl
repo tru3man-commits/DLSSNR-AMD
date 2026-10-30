@@ -224,4 +224,3 @@ void meter() {
     s = clamp(s, kMinGain, kMaxGain);
     st.s[0] = s; st.s[1] = 1.0; st.s[2] = exp2(s + pc.bias);
 }
-

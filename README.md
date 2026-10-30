@@ -1,5 +1,8 @@
 # DLSSNR-AMD
 
+This branch contains a [Windows preview port of the 0.0.8 processing path](docs/windows-0.0.8-port.md).
+See that page for installation, validation and remaining runtime tests.
+
 Runs the neural rendering (NR) model of NVIDIA DLSS 5 in games on AMD Radeon RX 9000 (RDNA4)
 graphics cards.
 
