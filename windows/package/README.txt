@@ -1,12 +1,17 @@
-DLSSNR-AMD-Vulkan (Windows, experimental preview)
-=================================================
+DLSSNR-AMD-Vulkan (Windows)
+===========================
+
+0.0.8 processing port preview: not yet validated in games on Windows.
+The new layer controls are on ReShade's Add-ons page. The experimental small model
+is unavailable because its Windows ACO records are not included. OptiScaler keeps
+the existing NR route; the Linux ASI integration is not included. Driver and image
+quality measurements below describe upstream releases, not this port.
 
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. The network is
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 
-This is an experimental preview and has not been tested much: game crashes, driver resets and
-other unexpected problems can happen. It is slower than the Linux version and updated less
-often, and some releases may be Linux only. If something breaks, uninstall with option 5 of
+It is slower than the Linux version and updated less often, and some releases may be Linux
+only. If something breaks, uninstall with option 5 of
 install.bat.
 
 DX10/11/12 games keep the system's own D3D; nothing is translated. NR runs on a Vulkan device

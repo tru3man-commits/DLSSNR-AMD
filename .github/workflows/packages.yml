@@ -21,7 +21,23 @@ permissions:
   contents: write
 
 jobs:
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test temporal history gating
+        run: bash tests/run_temporal_gate.sh
+      - name: Test guide region normalization
+        run: bash tests/run_guide_region.sh
+      - name: Test GPU completion retention
+        run: bash tests/run_gpu_completion.sh
+      - name: Test Windows bridge submission lifecycle
+        run: bash tests/run_bridge_submit.sh
+
   linux:
+    needs: cpu-tests
     if: ${{ !contains(github.ref_name, '-win-') }}
     runs-on: ubuntu-24.04
     steps:
@@ -32,7 +48,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-multilib python3 libx11-dev libxcb1-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-multilib python3 p7zip-full
 
       - name: Cache pinned dependencies
         uses: actions/cache@v4
@@ -66,6 +82,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: cpu-tests
     if: ${{ vars.WINDOWS_PACKAGE != 'off' && !contains(github.ref_name, '-linux-') }}
     runs-on: ubuntu-24.04
     steps:
@@ -87,12 +104,6 @@ jobs:
             !toolchain/GE-Proton11-7-x86_64
             artifacts/ref
           key: deps-windows-${{ hashFiles('fetch_deps.sh') }}
-
-      - name: Test temporal history gating
-        run: bash tests/run_temporal_gate.sh
-
-      - name: Test guide region normalization
-        run: bash tests/run_guide_region.sh
 
       - name: Fetch dependencies
         run: bash fetch_deps.sh --windows
@@ -116,9 +127,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [linux, windows]
+    needs: [cpu-tests, linux, windows]
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.cpu-tests.result == 'success' &&
       (needs.linux.result == 'success' || (needs.linux.result == 'skipped' && contains(github.ref_name, '-win-'))) &&
       (needs.windows.result == 'success' || needs.windows.result == 'skipped')
     runs-on: ubuntu-24.04

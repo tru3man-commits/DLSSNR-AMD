@@ -39,8 +39,6 @@ struct Adapter {
 };
 std::mutex g_device_mutex;
 std::vector<Adapter> g_adapters;
-uint64_t g_submits{};
-uint64_t g_begins{};
 // A recorded job older than this many recordings is not run: the runtime recycles its per-recording
 // views and descriptor sets after 66 recordings and a released feature's history after 64.
 constexpr uint64_t kStaleAfter = 48;
@@ -654,12 +652,16 @@ bool Device::create_d3d10(ID3D10Device* device, uint32_t width, uint32_t height,
 bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const Image*>& images,
                           uint64_t acquire_key, uint64_t release_key) {
     std::vector<std::function<void()>> calls;
-    {
-        std::lock_guard<std::mutex> guard(jobs_mutex_);
-        if (job->gen != generation || job->state != Job::Ready) return false;
-        if (lost_) { drop_locked(job, calls); }
+    // Keep the recording reserved until submission has either succeeded or
+    // failed. discard()/cancel()/begin() must not recycle it inside vkQueueSubmit.
+    std::unique_lock<std::mutex> jobs_guard(jobs_mutex_);
+    if (!job || job->gen != generation || job->state != Job::Ready) return false;
+    if (lost_ || begins_ - job->serial > kStaleAfter) {
+        drop_locked(job, calls);
+        jobs_guard.unlock();
+        for (auto& c : calls) c();
+        return false;   // rejection does not depend on an optional callback
     }
-    if (!calls.empty()) { for (auto& c : calls) c(); return false; }
     std::vector<VkDeviceMemory> memories;
     for (const Image* i : images) if (i && i->memory) memories.push_back(i->memory);
     std::vector<uint64_t> acquire(memories.size(), acquire_key), release(memories.size(), release_key);
@@ -680,17 +682,16 @@ bool Device::submit_keyed(Job* job, uint64_t generation, const std::vector<const
         std::lock_guard<std::mutex> guard(queue_mutex_);
         r = vkQueueSubmit(queue_, 1, &si, job->fence);
     }
-    {
-        std::lock_guard<std::mutex> guard(jobs_mutex_);
-        if (r != VK_SUCCESS) {
-            drop_locked(job, calls);
-            static bool said = false;
-            if (!said) { said = true; log("[nr] bridge: keyed-mutex vkQueueSubmit failed (%d)", int(r)); }
-        } else {
-            job->state = Job::Submitted;
-            job->submitted = ++g_submits;
-        }
+    if (r != VK_SUCCESS) {
+        drop_locked(job, calls);
+        static std::atomic_flag said = ATOMIC_FLAG_INIT;
+        if (!said.test_and_set()) log("[nr] bridge: keyed-mutex vkQueueSubmit failed (%d)", int(r));
+        if (r == VK_ERROR_DEVICE_LOST && !lost_) { lost_ = true; log("[nr] bridge: our Vulkan device was lost"); }
+    } else {
+        job->state = Job::Submitted;
+        job->submitted = ++submits_;
     }
+    jobs_guard.unlock();
     for (auto& c : calls) c();
     return r == VK_SUCCESS;
 }
@@ -793,7 +794,7 @@ Job* Device::begin_locked(std::string* why, const void* owner) {
         return nullptr;
     }
     job->state = Job::Recording;
-    job->serial = ++g_begins;
+    job->serial = ++begins_;
     ++job->gen;
     job->owner = owner;
     job->dropped = nullptr;
@@ -924,26 +925,27 @@ bool Device::submit(Job* job, uint64_t generation, VkSemaphore wait, uint64_t wa
                     uint64_t signal_value) {
     std::vector<std::function<void()>> calls;
     bool out_of_order = false;
-    {
-        std::lock_guard<std::mutex> guard(jobs_mutex_);
-        if (!job || job->gen != generation || job->state != Job::Ready) return false;
-        if (lost_ || g_begins - job->serial > kStaleAfter) {
-            // Recorded too long ago: what the runtime recorded it against may have been recycled since.
-            static bool said = false;
-            if (!lost_ && !said) {
-                said = true;
-                log("[nr] bridge: a frame recorded %llu recordings ago was not run (its command list ran late)",
-                    static_cast<unsigned long long>(g_begins - job->serial));
-            }
-            drop_locked(job, calls);
-        } else {
-            // Its owner's history was recorded in an order the GPU will not run it in.
-            for (auto& j : jobs_)
-                if (j.get() != job && j->owner == job->owner && j->state == Job::Ready && j->serial < job->serial)
-                    out_of_order = true;
+    // Lock order: jobs, then queue. Keep the validated generation reserved
+    // through the Vulkan call and publication of Submitted. Callbacks run only
+    // after both locks have been released.
+    std::unique_lock<std::mutex> jobs_guard(jobs_mutex_);
+    if (!job || job->gen != generation || job->state != Job::Ready) return false;
+    if (lost_ || begins_ - job->serial > kStaleAfter) {
+        // Recorded too long ago: what the runtime recorded it against may have been recycled since.
+        static std::atomic_flag said = ATOMIC_FLAG_INIT;
+        if (!lost_ && !said.test_and_set()) {
+            log("[nr] bridge: a frame recorded %llu recordings ago was not run (its command list ran late)",
+                static_cast<unsigned long long>(begins_ - job->serial));
         }
+        drop_locked(job, calls);
+        jobs_guard.unlock();
+        for (auto& c : calls) c();
+        return false;   // no callback is required for a job to be rejected
     }
-    if (!calls.empty()) { for (auto& c : calls) c(); return false; }
+    // Its owner's history was recorded in an order the GPU will not run it in.
+    for (auto& j : jobs_)
+        if (j.get() != job && j->owner == job->owner && j->state == Job::Ready && j->serial < job->serial)
+            out_of_order = true;
     VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     ts.waitSemaphoreValueCount = 1; ts.pWaitSemaphoreValues = &wait_value;
     ts.signalSemaphoreValueCount = 1; ts.pSignalSemaphoreValues = &signal_value;
@@ -958,23 +960,21 @@ bool Device::submit(Job* job, uint64_t generation, VkSemaphore wait, uint64_t wa
         std::lock_guard<std::mutex> guard(queue_mutex_);
         r = vkQueueSubmit(queue_, 1, &si, job->fence);
     }
-    {
-        std::lock_guard<std::mutex> guard(jobs_mutex_);
-        if (r != VK_SUCCESS) {
-            drop_locked(job, calls);
-            static bool said = false;
-            if (!said) { said = true; log("[nr] bridge: vkQueueSubmit failed (%d)", int(r)); }
-            if (r == VK_ERROR_DEVICE_LOST && !lost_) { lost_ = true; log("[nr] bridge: our Vulkan device was lost"); }
-        } else {
-            job->state = Job::Submitted;
-            job->submitted = ++g_submits;
-            if (out_of_order && job->dropped) {
-                static bool said = false;
-                if (!said) { said = true; log("[nr] bridge: frames ran in another order than they were recorded; history restarts"); }
-                calls.push_back(job->dropped);
-            }
+    if (r != VK_SUCCESS) {
+        drop_locked(job, calls);
+        static std::atomic_flag said = ATOMIC_FLAG_INIT;
+        if (!said.test_and_set()) log("[nr] bridge: vkQueueSubmit failed (%d)", int(r));
+        if (r == VK_ERROR_DEVICE_LOST && !lost_) { lost_ = true; log("[nr] bridge: our Vulkan device was lost"); }
+    } else {
+        job->state = Job::Submitted;
+        job->submitted = ++submits_;
+        if (out_of_order && job->dropped) {
+            static std::atomic_flag said = ATOMIC_FLAG_INIT;
+            if (!said.test_and_set()) log("[nr] bridge: frames ran in another order than they were recorded; history restarts");
+            calls.push_back(job->dropped);
         }
     }
+    jobs_guard.unlock();
     for (auto& c : calls) c();
     return r == VK_SUCCESS;
 }
@@ -1144,7 +1144,7 @@ bool Device::run_between(ID3D12CommandQueue* queue, Job* job, uint64_t generatio
         log("[nr] bridge: the D3D12 queue refused to wait for the network (0x%08lX)", (unsigned long)hr);
         lost("the D3D12 queue does not wait on the shared fence");
     }
-    return ok;
+    return ok && SUCCEEDED(hr);
 }
 
 bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t generation) {
@@ -1184,7 +1184,7 @@ bool Device::run_between(ID3D11DeviceContext* context, Job* job, uint64_t genera
         lost("the D3D11 context does not wait on the shared fence");
     }
     c4->Release();
-    return ok;
+    return ok && SUCCEEDED(hr);
 }
 
 
